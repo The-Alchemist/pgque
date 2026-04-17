@@ -28,6 +28,14 @@ The plan below is grounded in:
   clarification in `02f649d`).
 - **Diátaxis** ([documentation.divio.com](https://documentation.divio.com/)) —
   four-quadrant model: tutorials, how-to guides, reference, explanation.
+- **Kreen & Pihlak, PgCon 2009** — "PgQ: generic queue for PostgreSQL"
+  ([slides](https://www.pgcon.org/2009/schedule/attachments/91_pgq.pdf),
+  [event](https://www.pgcon.org/2009/schedule/events/138.en.html)). The
+  canonical vocabulary (event, batch, tick, producer, consumer, ticker)
+  and the ticker rule come from this talk. See section 9. PR #54
+  (`claude/extract-pgq-docs-EUM1D`) lands this material as
+  `docs/pgq-concepts.md` and `docs/pgq-history.md`; section 9 treats it
+  as the project-wide glossary and binds it to the rest of this plan.
 - **postgres-ai shared rules**
   ([gitlab.com/postgres-ai/rules](https://gitlab.com/postgres-ai/rules/-/tree/main/rules))
   — referenced from `CLAUDE.md`. The writing rules in particular shape tone,
@@ -393,7 +401,235 @@ Prioritized so each PR is reviewable on its own and unblocks the next one.
 8. **Reference: `schema.md`, `roles.md`** — last because they are the
    driest and least-frequently-read.
 
-## 9. Out of scope for this design doc
+## 9. PgQ vocabulary — canonical glossary (Kreen & Pihlak, PgCon 2009)
+
+All user-facing docs use this vocabulary. The terms come from the 2009 PgCon
+talk by Marko Kreen and Martin Pihlak. Using the same words the authors used
+protects the lineage and avoids inventing a second vocabulary for the same
+objects. PR #54 (`claude/extract-pgq-docs-EUM1D`) lands the same material as
+standalone primers under `docs/pgq-concepts.md` and `docs/pgq-history.md`;
+this section is the binding between that vocabulary and every other doc in
+the plan.
+
+### 9.1 Glossary
+
+- **Event** — one row in a queue table. Delivered *at-least-once*.
+- **Batch** — events between two ticks, served to a consumer together.
+- **Queue** — named event stream; three rotating tables, purged by
+  `TRUNCATE`.
+- **Producer** — anything that calls `insert_event` / `pgque.send`.
+- **Consumer** — subscribes, reads batches, calls `ack` (or
+  `finish_batch`).
+- **Ticker** — creates ticks, vacuums, rotates, reschedules retries.
+  In PgQue: `pg_cron` calling `pgque.ticker()`.
+- **Tick** — position marker in the event stream; delimits batches.
+
+### 9.2 Delivery
+
+At-least-once. Exactly-once requires either:
+
+- **Same DB:** process in the same transaction as `finish_batch` / `ack`.
+- **Cross DB:** target-side batch/event tracking
+  (`pgque.is_batch_done`).
+
+### 9.3 Consumer loop — canonical form
+
+```
+batch_id = next_batch(queue, consumer)   -- NULL → sleep, retry
+events   = get_batch_events(batch_id)
+process(events)                           -- nack individual failures
+finish_batch(batch_id)
+commit
+```
+
+### 9.4 Event row
+
+`ev_id`, `ev_time`, `ev_txid` (`xid8`), `ev_retry`, `ev_type`, `ev_data`,
+`ev_extra1..4`. `ev_extra1` is table name by convention (triggers).
+Payload format is a producer/consumer contract; PgQue does not interpret
+it.
+
+### 9.5 Health signals
+
+From `pgque.get_consumer_info()`:
+
+- **lag** — age of the last finished batch; high ⇒ falling behind.
+- **last_seen** — time since the last batch; high ⇒ consumer not running.
+
+### 9.6 Per-queue tuning
+
+Stored on `pgque.queue`, read by `pgque.ticker()`. Set via
+`pgque.create_queue(name, options jsonb)` or `pgque.set_queue_config`.
+
+- `ticker_max_lag` — max wall time between ticks.
+- `ticker_idle_period` — tick interval when idle.
+- `ticker_max_count` — force a tick at N events (batch-size cap).
+- `rotation_period` — table-rotation period (disk vs. history).
+
+### 9.7 The ticker rule — verbatim
+
+> Keep the ticker running. No ticks → no batches → no delivery. Long
+> pauses produce huge batches consumers can't handle.
+
+— Kreen & Pihlak, PgCon 2009.
+
+### 9.8 Lineage — short
+
+- **2006** — PgQ started at Skype. Inspired by Slony.
+- **2007** — Open-sourced as part of Skytools. First application:
+  Londiste replication.
+- **2009** — Skytools 3: cascading, cooperative consumers. PgCon talk by
+  Kreen & Pihlak.
+- **2026** — PgQue: PG14+ single-file repackage for managed databases.
+
+PgQ (Skype, ISC) → Skytools 2/3 → `github.com/pgq/pgq` → **PgQue**
+(Apache-2.0, PG14+). Skype ran hundreds of queues on PgQ in production;
+PgQue inherits that engine and does not reinvent it.
+
+### 9.9 Where this material lands in the docs tree
+
+- The glossary (9.1) opens `docs/explanation/architecture.md` and is
+  reused verbatim as a "Vocabulary" panel in the tutorial.
+- Delivery semantics (9.2) seed `docs/explanation/exactly-once-semantics.md`.
+- The consumer loop (9.3) is the single canonical form referenced from
+  every how-to that touches the read path.
+- The event row (9.4) is the source for
+  `docs/reference/message-format.md`.
+- Health signals + tuning (9.5, 9.6) feed
+  `docs/reference/configuration.md` and `docs/howto/monitoring.md`.
+- The ticker rule (9.7) is pulled as a blockquote in the README, the
+  tutorial, and `docs/howto/manual-maintenance.md`.
+- Lineage (9.8) is the spine of `docs/explanation/pgq-heritage.md`.
+
+## 10. DevRel considerations — positioning, the bloat-bakeoff, README leverage
+
+This section pairs the documentation plan above with the marketing
+surface. Docs and DevRel share one job: make "doesn't degrade" a
+*visible* claim. "Doesn't degrade" is a negative — the absence of
+something. Absences don't go viral. The work is to make decay visible
+everywhere else and show the PgQue line staying flat.
+
+### 10.1 README leverage — ranked
+
+Targeted changes to `README.md`, ranked by reader reaction per unit of
+effort. Items 1–3 are near-term; 4–10 are follow-up.
+
+1. **Lead with a 15-second visual proof, not prose.** Above the fold:
+   one chart or GIF — dead tuples over 24 hours, PgQue flat, competitors
+   climbing. Today the reader must reach "Why PgQue" before seeing the
+   thesis. Every recent Postgres-adjacent breakout (ClickHouse, Turso,
+   Dragonfly, Bun) leads with one picture.
+2. **Move benchmark numbers up, strip the prose.** "85,836 events/sec on
+   a laptop, zero dead tuples after 30 days" is a tweetable opening
+   line. Split the benchmark table into two — producer-side and
+   consumer-side. The 2.4 M events/s consumer read is currently buried
+   and should not be.
+3. **Add a two-sentence "Why this exists" above "Why PgQue".**
+   Concentrates the decay-mode evidence the README already cites in
+   scattered form (Heroku 2015, PlanetScale 2026, River, Oban, PGMQ).
+   One paragraph, not four bullets spread across three sections.
+4. **Split the comparison table.** Eight columns is unreadable on
+   mobile. Two tables: "vs. other Postgres queues" and "vs. external
+   queues (Kafka, SQS, Redis Streams)". The second pre-empts the first
+   Hacker News question.
+5. **Five-minute demo container.** `docker run
+   ghcr.io/nikolays/pgque-demo` with PgQue pre-installed, a load
+   generator, and a Grafana dashboard on port 3000 showing zero bloat
+   while it runs. Collapses the "try it" funnel from ~20 minutes to
+   ~60 seconds. PGMQ has this; PgQue should too.
+6. **Strengthen the client-library section.** Ctrl-F for a language is
+   the first thing decision-makers do. Either ship rough-but-working
+   libs in 3–4 languages, or lean hard into "any Postgres driver works
+   — here are five one-liners" without framing anything as missing.
+7. **Social proof.** A "Who uses this?" section the moment anyone
+   nontrivial adopts PgQue. Stars-over-time graph. Sponsors block.
+8. **FAQ.** Written pre-emptively against the first ten HN questions:
+   how does this compare to Kafka; can I run this on Supabase; what
+   happens without `pg_cron`; upgrade story; API stability;
+   crash-safety.
+9. **"Anti-extension" as brand asset.** A brandable, sticker-able
+   concept. SVG in the README; stickers to the first N stargazers.
+10. **Pronunciation + SEO.** One sentence: "PgQue (pronounced
+    'peg-cue' — PgQ, universal edition)." Removes a micro-friction every
+    reader hits, helps search separate PgQue from PgQ.
+
+### 10.2 "Make decay visible" — the playbook
+
+Ranked by leverage. Same logic as the ClickHouse public benchmark, the
+TigerBeetle VOPR, Brandur's 2015 post: the *proof* becomes the product.
+
+1. **The Bloat Bakeoff.** A public, always-on, real-time dashboard at
+   one URL. Five queues in parallel containers (PgQue, PGMQ, River,
+   pg-boss, Que) under identical load. Public Grafana showing
+   throughput, dead-tuple count, table size, p99 enqueue/dequeue,
+   vacuum time, `xmin` horizon lag. Uptime 24/7/365. Evergreen: every
+   competitor release is an excuse to re-share the chart. Budget
+   ~$50/month; upside is the ClickHouse-benchmark move applied to the
+   one dimension where PgQue structurally wins.
+2. **"Why Your Postgres Queue Rots" — a visual essay.** One long-form
+   explainer with animated SVGs: how a tuple becomes dead, how `VACUUM`
+   fails under a pinned `xmin`, how `SKIP LOCKED` scans skip more rows
+   over time, how three-table rotation yields zero dead tuples by
+   construction. Written as the continuation of Brandur's 2015 post:
+   "…and here is how we actually fixed this." The same artifact is
+   `docs/explanation/bloat-free-design.md` from section 5.4 —
+   rendered at two quality bars, one canonical source.
+3. **Conference demo.** Live: three queues side-by-side, identical
+   load, open a `BEGIN; SELECT pg_sleep(600);` session in psql. PGMQ's
+   vacuum collapses, River's throughput nosedives, PgQue keeps going.
+   Fifteen minutes, recorded; clips into a 45-second video.
+4. **Postgres Queue Graveyard.** A page cataloguing every publicly
+   documented production outage caused by Postgres queue bloat: Heroku
+   2015, PlanetScale 2026, River #59, matching Oban/PGMQ issues. Each
+   entry: date, company, queue library, root cause, one-paragraph
+   postmortem. Community submissions welcome. Every entry is public
+   material — earned SEO, not dark-pattern.
+5. **One-command local reproducer.** `docker run
+   ghcr.io/pgque/bakeoff` spins up the five-queue dashboard locally.
+   Skeptics who dismiss public benchmarks run it on their own laptop in
+   60 seconds and see the same line. Short-circuits most
+   "synthetic-benchmark" pushback.
+6. **Originator blessing.** Alexander Kukushkin recently presented
+   "Rediscovering PgQ". Marko Kreen is reachable. A one-line endorsement
+   from either in the README is a narrative lock. Offer co-authorship
+   of the visual essay (#2) or a PostgresFM episode.
+7. **Coin a metric.** Define "Queue Decay Rate" —
+   dead-tuple-growth per event processed — as a formal metric. Publish
+   a spec. Ask competitors to report theirs. Low odds; high upside if
+   it catches on, same shape as Redis `ops/sec`.
+8. **One-billion-message challenge.** Run 1 B messages through PgQue.
+   Publish hardware, config, runtime, table size before/after,
+   dead-tuple count before/after, vacuum total. Invite every competing
+   queue to match it. 1BRC-style.
+
+If only two land, land **#1 and #2.** The dashboard is evergreen proof;
+the essay is the canonical reference. Every tweet, README line,
+conference talk, and HN comment for the next two years points at one of
+those two URLs.
+
+### 10.3 Voice — keep the honesty
+
+The "latency trade-off" paragraph currently in the README is doing a
+lot of work for trust. That tone — aggressive claim *paired* with
+explicit admission of where PgQue is not the right tool — is the
+reason the "zero bloat" claim reads as credible rather than as
+marketing. Preserve it everywhere: README, tutorial, explanations, and
+every DevRel artifact. Honesty is the moat we already have.
+
+### 10.4 Relationship to the docs plan
+
+- Sections 4–5 own in-repo Markdown.
+- 10.1–10.2 own positioning, public artifacts, and the landing-page
+  surface of the README.
+- One piece of content should never be forked. The bloat-free-design
+  explainer is the same artifact as the visual essay (#2), rendered at
+  two quality bars. The glossary in section 9 is used verbatim across
+  tutorial, reference, and any external essay or talk.
+- DevRel artifacts (Bakeoff, graveyard, essay) live outside the repo
+  as separate projects and landing pages, but link back into `docs/`
+  for depth. They never duplicate vocabulary — they import section 9.
+
+## 11. Out of scope for this design doc
 
 - Client library docs (`pgque-py`, `pgque-go`, CLI). Each gets its own
   `docs/` tree under its own subdirectory or repo when those projects
@@ -405,7 +641,7 @@ Prioritized so each PR is reviewable on its own and unblocks the next one.
   changing the source structure.
 - Translations.
 
-## 10. Open questions
+## 12. Open questions
 
 - Should the `docs/` index live as a section in the README, as a separate
   `docs/README.md`, or both? Recommendation: both. README links to four
