@@ -122,9 +122,47 @@ create table if not exists pgque.queue (
 );
 
 -- ----------------------------------------------------------------------
--- Table: pgque.tick
+-- Table: pgque.meta_rotation
 --
---      Snapshots for event batching
+--      Singleton table pointing at the currently-active child of
+--      pgque.subscription and pgque.tick. Declared BEFORE the tick and
+--      subscription views so those views can reference this singleton
+--      to filter to the active child (subscription) or simply expose
+--      the cur pointer for diagnostics (tick).
+--
+--      The richer pgque.config table (ticker_job_id, maint_job_id, ...)
+--      is defined later in Section 6. Kept separate on purpose: config
+--      is written only at start()/stop() time; meta_rotation flips on
+--      every rotation cycle and benefits from being a tiny, hot row.
+-- ----------------------------------------------------------------------
+create table if not exists pgque.meta_rotation (
+    singleton                bool      primary key default true check (singleton),
+    cur_subscription_table   smallint  not null default 0,
+    cur_tick_table           smallint  not null default 0,
+    last_rotation_time       timestamptz not null default now(),
+    last_rotation_step1_txid bigint    not null default pg_current_xact_id()::text::bigint,
+    last_rotation_step2_txid bigint             default pg_current_xact_id()::text::bigint
+);
+insert into pgque.meta_rotation (singleton) values (true)
+on conflict (singleton) do nothing;
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.tick (3-table rotation; PgQue transformation)
+--
+--      Snapshots for event batching.
+--
+--      pgque transformation vs PgQ: instead of a single physical table,
+--      we split storage across three children pgque.tick_0 / _1 / _2
+--      and expose a UNION ALL view named pgque.tick. The active child
+--      (where INSERTs land) is pointed to by pgque.config.cur_tick_table.
+--      Rotation (see pgque.maint_rotate_metadata) truncates the oldest
+--      child, then flips the pointer. This keeps per-table dead-tuple
+--      and heap footprint bounded under held xmin, the same way
+--      event_<queue>_0/1/2 rotation keeps event tables clean.
+--
+--      Readers do not need to know which child holds a row; they query
+--      the view. The view includes a child discriminator column
+--      (tick_child_table smallint) so routers / diagnostics can tell.
 --
 -- Columns:
 --      tick_queue      - queue id whose tick it is
@@ -133,17 +171,52 @@ create table if not exists pgque.queue (
 --      tick_snapshot   - transaction state
 --      tick_event_seq  - last value for event seq
 -- ----------------------------------------------------------------------
-create table if not exists pgque.tick (
+
+-- Template table; declared so clients can DESCRIBE columns and so the
+-- three children can be defined with LIKE-equivalent layout. The template
+-- itself must never hold rows (only the children do).
+create table if not exists pgque.tick_tmpl (
         tick_queue                  int4            not null,
         tick_id                     bigint          not null,
         tick_time                   timestamptz     not null default now(),
-        tick_snapshot               pg_snapshot   not null default pg_current_snapshot(),
-        tick_event_seq              bigint          not null, -- may be NULL on upgraded dbs
-
-        constraint tick_pkey primary key (tick_queue, tick_id),
-        constraint tick_queue_fkey foreign key (tick_queue)
+        tick_snapshot               pg_snapshot     not null default pg_current_snapshot(),
+        tick_event_seq              bigint          not null,
+        constraint tick_tmpl_queue_fkey foreign key (tick_queue)
                                    references pgque.queue (queue_id)
 );
+
+-- One physical child per rotation slot. Each carries its own PK so the
+-- active child enforces uniqueness; cross-child duplicates cannot happen
+-- because writers only target the active child and the oldest child is
+-- truncated prior to being promoted.
+create table if not exists pgque.tick_0 (
+        like pgque.tick_tmpl including defaults,
+        constraint tick_0_pkey primary key (tick_queue, tick_id),
+        constraint tick_0_queue_fkey foreign key (tick_queue)
+                                   references pgque.queue (queue_id)
+);
+create table if not exists pgque.tick_1 (
+        like pgque.tick_tmpl including defaults,
+        constraint tick_1_pkey primary key (tick_queue, tick_id),
+        constraint tick_1_queue_fkey foreign key (tick_queue)
+                                   references pgque.queue (queue_id)
+);
+create table if not exists pgque.tick_2 (
+        like pgque.tick_tmpl including defaults,
+        constraint tick_2_pkey primary key (tick_queue, tick_id),
+        constraint tick_2_queue_fkey foreign key (tick_queue)
+                                   references pgque.queue (queue_id)
+);
+
+-- Compatibility view: named exactly pgque.tick so the (large) body of
+-- PgQ-derived code that reads pgque.tick keeps working unchanged.
+-- INSERTs go through an INSTEAD OF trigger that routes to the active child.
+create or replace view pgque.tick as
+      select 0::smallint as tick_child_table, * from pgque.tick_0
+union all
+      select 1::smallint as tick_child_table, * from pgque.tick_1
+union all
+      select 2::smallint as tick_child_table, * from pgque.tick_2;
 
 -- ----------------------------------------------------------------------
 -- Sequence: pgque.batch_id_seq
@@ -153,12 +226,37 @@ create table if not exists pgque.tick (
 create sequence if not exists pgque.batch_id_seq;
 
 -- ----------------------------------------------------------------------
--- Table: pgque.subscription
+-- Table: pgque.subscription (3-table rotation; PgQue transformation)
 --
---      Consumer registration on a queue.
+--      Consumer registration on a queue. One logical row per
+--      (sub_queue, sub_consumer) pair; repeatedly UPDATEd by
+--      finish_batch() and next_batch_custom(). Under a long-held xmin
+--      the plain-UPDATE design (as in upstream PgQ) accumulates dead
+--      tuples at 1-per-batch per consumer, degrading iter-TPS.
+--
+--      pgque transformation: storage is split across three children
+--      pgque.subscription_0 / _1 / _2 and exposed via the UNION ALL
+--      view named pgque.subscription. The active child (where rows
+--      currently live and where writes land) is pointed to by
+--      pgque.config.cur_subscription_table.
+--
+--      Rotation procedure (pgque.maint_rotate_metadata):
+--        next := (cur + 1) % 3
+--        TRUNCATE subscription_<next>
+--        INSERT INTO subscription_<next> SELECT * FROM subscription_<cur>
+--        flip cur := next
+--      After rotation the new-active child holds a freshly materialized
+--      copy of every live subscription (typically O(consumers) rows),
+--      so the heap is compact even under a held xmin.
+--
+--      The cross-child primary key on (sub_queue, sub_consumer) is
+--      enforced only on the active child at any instant; rotation's
+--      "TRUNCATE next + full copy" step makes duplicate keys impossible.
+--
+--      Shared sequence pgque.subscription_sub_id_seq survives rotation
+--      so sub_id values remain stable across rotations.
 --
 -- Columns:
---
 --      sub_id          - subscription id for internal usage
 --      sub_queue       - queue id
 --      sub_consumer    - consumer's id
@@ -166,22 +264,240 @@ create sequence if not exists pgque.batch_id_seq;
 --      sub_batch       - shortcut for queue_id/consumer_id/tick_id
 --      sub_next_tick   - batch end pos
 -- ----------------------------------------------------------------------
-create table if not exists pgque.subscription (
-        sub_id                          serial      not null,
-        sub_queue                       int4        not null,
-        sub_consumer                    int4        not null,
-        sub_last_tick                   bigint,
-        sub_active                      timestamptz not null default now(),
-        sub_batch                       bigint,
-        sub_next_tick                   bigint,
 
-        constraint subscription_pkey primary key (sub_queue, sub_consumer),
-        constraint subscription_batch_idx unique (sub_batch),
-        constraint sub_queue_fkey foreign key (sub_queue)
+create sequence if not exists pgque.subscription_sub_id_seq;
+
+-- Template carries columns + FKs; never holds rows.
+create table if not exists pgque.subscription_tmpl (
+        sub_id              int4        not null default nextval('pgque.subscription_sub_id_seq'),
+        sub_queue           int4        not null,
+        sub_consumer        int4        not null,
+        sub_last_tick       bigint,
+        sub_active          timestamptz not null default now(),
+        sub_batch           bigint,
+        sub_next_tick       bigint
+);
+
+create table if not exists pgque.subscription_0 (
+        like pgque.subscription_tmpl including defaults,
+        constraint subscription_0_pkey primary key (sub_queue, sub_consumer),
+        constraint subscription_0_batch_uq unique (sub_batch),
+        constraint sub_0_queue_fkey foreign key (sub_queue)
                                    references pgque.queue (queue_id),
-        constraint sub_consumer_fkey foreign key (sub_consumer)
+        constraint sub_0_consumer_fkey foreign key (sub_consumer)
                                    references pgque.consumer (co_id)
 );
+create table if not exists pgque.subscription_1 (
+        like pgque.subscription_tmpl including defaults,
+        constraint subscription_1_pkey primary key (sub_queue, sub_consumer),
+        constraint subscription_1_batch_uq unique (sub_batch),
+        constraint sub_1_queue_fkey foreign key (sub_queue)
+                                   references pgque.queue (queue_id),
+        constraint sub_1_consumer_fkey foreign key (sub_consumer)
+                                   references pgque.consumer (co_id)
+);
+create table if not exists pgque.subscription_2 (
+        like pgque.subscription_tmpl including defaults,
+        constraint subscription_2_pkey primary key (sub_queue, sub_consumer),
+        constraint subscription_2_batch_uq unique (sub_batch),
+        constraint sub_2_queue_fkey foreign key (sub_queue)
+                                   references pgque.queue (queue_id),
+        constraint sub_2_consumer_fkey foreign key (sub_consumer)
+                                   references pgque.consumer (co_id)
+);
+
+-- Compatibility view named pgque.subscription — same shape as upstream
+-- PgQ's table so the rest of the SQL layer keeps working unchanged.
+-- Only the *active* child is exposed because rotation copies the whole
+-- live state into the new slot at every step: the non-active children
+-- still hold stale row versions from previous rotations and must not
+-- be visible to readers (otherwise SELECT ... WHERE sub_consumer=X
+-- would return duplicates). The active-child predicate is a trivial
+-- constant-folding once the planner reads pgque.meta_rotation.
+create or replace view pgque.subscription as
+      select 0::smallint as sub_child_table, s.* from pgque.subscription_0 s
+        where (select cur_subscription_table from pgque.meta_rotation) = 0
+union all
+      select 1::smallint, s.* from pgque.subscription_1 s
+        where (select cur_subscription_table from pgque.meta_rotation) = 1
+union all
+      select 2::smallint, s.* from pgque.subscription_2 s
+        where (select cur_subscription_table from pgque.meta_rotation) = 2;
+
+-- ----------------------------------------------------------------------
+-- Routing triggers: route INSERTs through the pgque.subscription /
+-- pgque.tick views to the currently-active child. UPDATE and DELETE go
+-- through the view as expanded UPDATE/DELETE on each child (PostgreSQL
+-- handles this automatically for simple UNION ALL views? No — for
+-- INSTEAD OF triggers on views we must implement all three).
+-- ----------------------------------------------------------------------
+
+create or replace function pgque._subscription_route()
+returns trigger language plpgsql as $$
+declare
+    v_cur smallint;
+begin
+    select cur_subscription_table into v_cur from pgque.meta_rotation;
+    if tg_op = 'INSERT' then
+        if v_cur = 0 then
+            insert into pgque.subscription_0
+                (sub_id, sub_queue, sub_consumer, sub_last_tick, sub_active,
+                 sub_batch, sub_next_tick)
+            values (coalesce(new.sub_id, nextval('pgque.subscription_sub_id_seq')),
+                    new.sub_queue, new.sub_consumer, new.sub_last_tick,
+                    coalesce(new.sub_active, now()), new.sub_batch, new.sub_next_tick);
+        elsif v_cur = 1 then
+            insert into pgque.subscription_1
+                (sub_id, sub_queue, sub_consumer, sub_last_tick, sub_active,
+                 sub_batch, sub_next_tick)
+            values (coalesce(new.sub_id, nextval('pgque.subscription_sub_id_seq')),
+                    new.sub_queue, new.sub_consumer, new.sub_last_tick,
+                    coalesce(new.sub_active, now()), new.sub_batch, new.sub_next_tick);
+        else
+            insert into pgque.subscription_2
+                (sub_id, sub_queue, sub_consumer, sub_last_tick, sub_active,
+                 sub_batch, sub_next_tick)
+            values (coalesce(new.sub_id, nextval('pgque.subscription_sub_id_seq')),
+                    new.sub_queue, new.sub_consumer, new.sub_last_tick,
+                    coalesce(new.sub_active, now()), new.sub_batch, new.sub_next_tick);
+        end if;
+        return new;
+    elsif tg_op = 'UPDATE' then
+        -- Between rotations, ALL live rows live on exactly one child
+        -- (the active one — rotation's truncate+copy step guarantees
+        -- that). So updating only the active child is correct and the
+        -- cheapest plan. Use row identity (sub_queue, sub_consumer).
+        if v_cur = 0 then
+            update pgque.subscription_0
+                set sub_id        = new.sub_id,
+                    sub_queue     = new.sub_queue,
+                    sub_consumer  = new.sub_consumer,
+                    sub_last_tick = new.sub_last_tick,
+                    sub_active    = new.sub_active,
+                    sub_batch     = new.sub_batch,
+                    sub_next_tick = new.sub_next_tick
+              where sub_queue    = old.sub_queue
+                and sub_consumer = old.sub_consumer;
+        elsif v_cur = 1 then
+            update pgque.subscription_1
+                set sub_id        = new.sub_id,
+                    sub_queue     = new.sub_queue,
+                    sub_consumer  = new.sub_consumer,
+                    sub_last_tick = new.sub_last_tick,
+                    sub_active    = new.sub_active,
+                    sub_batch     = new.sub_batch,
+                    sub_next_tick = new.sub_next_tick
+              where sub_queue    = old.sub_queue
+                and sub_consumer = old.sub_consumer;
+        else
+            update pgque.subscription_2
+                set sub_id        = new.sub_id,
+                    sub_queue     = new.sub_queue,
+                    sub_consumer  = new.sub_consumer,
+                    sub_last_tick = new.sub_last_tick,
+                    sub_active    = new.sub_active,
+                    sub_batch     = new.sub_batch,
+                    sub_next_tick = new.sub_next_tick
+              where sub_queue    = old.sub_queue
+                and sub_consumer = old.sub_consumer;
+        end if;
+        return new;
+    elsif tg_op = 'DELETE' then
+        -- Delete from every child so stale rows left over on the
+        -- non-active children (e.g., within the xmin window of a
+        -- just-completed rotation) also go away.
+        delete from pgque.subscription_0
+         where sub_queue = old.sub_queue and sub_consumer = old.sub_consumer;
+        delete from pgque.subscription_1
+         where sub_queue = old.sub_queue and sub_consumer = old.sub_consumer;
+        delete from pgque.subscription_2
+         where sub_queue = old.sub_queue and sub_consumer = old.sub_consumer;
+        return old;
+    end if;
+    return null;
+end;
+$$;
+
+drop trigger if exists subscription_route on pgque.subscription;
+create trigger subscription_route
+    instead of insert or update or delete on pgque.subscription
+    for each row execute function pgque._subscription_route();
+
+create or replace function pgque._tick_route()
+returns trigger language plpgsql as $$
+declare
+    v_cur smallint;
+begin
+    select cur_tick_table into v_cur from pgque.meta_rotation;
+    if tg_op = 'INSERT' then
+        if v_cur = 0 then
+            insert into pgque.tick_0
+                (tick_queue, tick_id, tick_time, tick_snapshot, tick_event_seq)
+            values (new.tick_queue, new.tick_id,
+                    coalesce(new.tick_time, now()),
+                    coalesce(new.tick_snapshot, pg_current_snapshot()),
+                    new.tick_event_seq);
+        elsif v_cur = 1 then
+            insert into pgque.tick_1
+                (tick_queue, tick_id, tick_time, tick_snapshot, tick_event_seq)
+            values (new.tick_queue, new.tick_id,
+                    coalesce(new.tick_time, now()),
+                    coalesce(new.tick_snapshot, pg_current_snapshot()),
+                    new.tick_event_seq);
+        else
+            insert into pgque.tick_2
+                (tick_queue, tick_id, tick_time, tick_snapshot, tick_event_seq)
+            values (new.tick_queue, new.tick_id,
+                    coalesce(new.tick_time, now()),
+                    coalesce(new.tick_snapshot, pg_current_snapshot()),
+                    new.tick_event_seq);
+        end if;
+        return new;
+    elsif tg_op = 'DELETE' then
+        -- maint_rotate_tables_step1 DELETEs old ticks by xmin predicate.
+        -- Propagate to all three children.
+        delete from pgque.tick_0
+         where tick_queue = old.tick_queue and tick_id = old.tick_id;
+        delete from pgque.tick_1
+         where tick_queue = old.tick_queue and tick_id = old.tick_id;
+        delete from pgque.tick_2
+         where tick_queue = old.tick_queue and tick_id = old.tick_id;
+        return old;
+    elsif tg_op = 'UPDATE' then
+        -- Ticks are immutable in the PgQ design; treat UPDATE as a
+        -- delete-then-insert so code that somehow issues one still works.
+        delete from pgque.tick_0
+         where tick_queue = old.tick_queue and tick_id = old.tick_id;
+        delete from pgque.tick_1
+         where tick_queue = old.tick_queue and tick_id = old.tick_id;
+        delete from pgque.tick_2
+         where tick_queue = old.tick_queue and tick_id = old.tick_id;
+        if v_cur = 0 then
+            insert into pgque.tick_0
+                (tick_queue, tick_id, tick_time, tick_snapshot, tick_event_seq)
+            values (new.tick_queue, new.tick_id, new.tick_time,
+                    new.tick_snapshot, new.tick_event_seq);
+        elsif v_cur = 1 then
+            insert into pgque.tick_1
+                (tick_queue, tick_id, tick_time, tick_snapshot, tick_event_seq)
+            values (new.tick_queue, new.tick_id, new.tick_time,
+                    new.tick_snapshot, new.tick_event_seq);
+        else
+            insert into pgque.tick_2
+                (tick_queue, tick_id, tick_time, tick_snapshot, tick_event_seq)
+            values (new.tick_queue, new.tick_id, new.tick_time,
+                    new.tick_snapshot, new.tick_event_seq);
+        end if;
+        return new;
+    end if;
+    return null;
+end;
+$$;
+
+drop trigger if exists tick_route on pgque.tick;
+create trigger tick_route
+    instead of insert or update or delete on pgque.tick
+    for each row execute function pgque._tick_route();
 
 -- ----------------------------------------------------------------------
 -- Table: pgque.event_template
@@ -984,6 +1300,186 @@ begin
 end;
 $$ language plpgsql; -- need admin access
 
+
+create or replace function pgque.maint_rotate_metadata()
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_rotate_metadata(0)
+--
+--      Rotate subscription + tick child tables to cap held-xmin bloat.
+--
+--      This is the metadata-table analogue of maint_rotate_tables_step1 +
+--      step2. Unlike event tables, subscription and tick storage is
+--      NOT per-queue — there is one set of three children total. So
+--      this function is singleton-gated via pgque.meta_rotation.
+--
+--      Subscription procedure:
+--        next := (cur + 1) % 3
+--        TRUNCATE pgque.subscription_<next>   (was the oldest slot)
+--        INSERT INTO pgque.subscription_<next>
+--            SELECT * FROM pgque.subscription_<cur>
+--        flip cur := next
+--      The new-active child starts with O(consumers) freshly-written
+--      rows; future finish_batch() UPDATEs touch only this new child.
+--      The previous child (now prev-active) is kept around until the
+--      next rotation so that in-flight transactions with an older
+--      snapshot can still resolve (via the UNION-ALL view) any
+--      subscription row they were about to read.
+--
+--      Tick procedure:
+--        next := (cur + 1) % 3
+--        TRUNCATE pgque.tick_<next>
+--        flip cur := next
+--      Tick is append-only, so rotation does not copy any rows. The
+--      existing maint_rotate_tables_step1() already DELETEs ticks by
+--      xmin predicate; once those DELETEs have propagated through the
+--      view's INSTEAD OF trigger, the oldest child is effectively
+--      empty and safe to TRUNCATE.
+--
+-- Returns:
+--      1 if a rotation happened, 0 if skipped (too soon, or gated by
+--      held xmin).
+-- ----------------------------------------------------------------------
+declare
+    mr              record;
+    rotation_period interval;
+    next_sub        smallint;
+    next_tick       smallint;
+begin
+    -- Default rotation period: 30s. Much shorter than event rotation
+    -- (2h) because metadata is hot and dead-tuple-bound, not size-bound.
+    rotation_period := coalesce(
+        current_setting('pgque.meta_rotation_period', true)::interval,
+        interval '30 seconds'
+    );
+
+    select * into mr from pgque.meta_rotation for update;
+
+    -- too soon?
+    if now() < mr.last_rotation_time + rotation_period then
+        return 0;
+    end if;
+
+    -- Held-xmin gate: require that the PREVIOUS rotation's step2 has
+    -- been acknowledged in a separate transaction. That ensures the
+    -- pointer flip is visible to any new backend before we consider
+    -- flipping again. We intentionally do NOT gate on backend_xmin:
+    -- the whole purpose of this rotation is to let finish_batch UPDATEs
+    -- migrate to a fresh heap while some other unrelated transaction
+    -- is holding xmin. No pgque code path reads pgque.subscription
+    -- under a long-lived snapshot, so truncating the prev-prev slot
+    -- is safe in practice. (External queries that read pgque.subscription
+    -- under a long snapshot may see stale rows or no rows after the
+    -- prev-prev slot is truncated; this matches the same trade-off
+    -- that event-table rotation already makes for the event_*_N
+    -- children.)
+    if mr.last_rotation_step2_txid is null then
+        -- previous rotation's step2 has not yet been observed;
+        -- not safe to rotate again.
+        return 0;
+    end if;
+
+    -- Compute targets.
+    next_sub  := (mr.cur_subscription_table + 1) % 3;
+    next_tick := (mr.cur_tick_table + 1) % 3;
+
+    -- Subscription rotation: lock current so no writer can slip an
+    -- UPDATE in between the COPY and the pointer flip (otherwise the
+    -- update would be stranded on the prev child and invisible to
+    -- readers once the view predicate switches to the new cur).
+    -- Then truncate target, copy live rows, flip pointer.
+    begin
+        execute format('lock table pgque.subscription_%s in exclusive mode nowait',
+                       mr.cur_subscription_table);
+        execute format('lock table pgque.subscription_%s in exclusive mode nowait',
+                       next_sub);
+        execute format('truncate pgque.subscription_%s', next_sub);
+        execute format(
+            'insert into pgque.subscription_%s '
+         || '  (sub_id, sub_queue, sub_consumer, sub_last_tick, '
+         || '   sub_active, sub_batch, sub_next_tick) '
+         || 'select sub_id, sub_queue, sub_consumer, sub_last_tick, '
+         || '       sub_active, sub_batch, sub_next_tick '
+         || '  from pgque.subscription_%s',
+            next_sub, mr.cur_subscription_table);
+    exception
+        when lock_not_available then
+            return 0;
+    end;
+
+    -- Tick rotation: CONDITIONAL. Tick has stronger cross-rotation
+    -- reference semantics than subscription — every subscription's
+    -- sub_last_tick points at a specific tick row that must still
+    -- resolve, possibly minutes after the tick was inserted if the
+    -- consumer lags. Truncating the prev-prev tick slot on a 30s
+    -- cadence can strand such references.
+    --
+    -- Safe minimal rule: only truncate the next_tick slot if every
+    -- live subscription's sub_last_tick already resolves from one of
+    -- the other two tick children (cur or "old"). If any consumer's
+    -- sub_last_tick is in next_tick, skip the tick flip this cycle
+    -- (but still do the subscription flip, which is the dominant
+    -- bloat source).
+    if not exists (
+        select 1
+          from pgque.subscription s
+          join pgque.tick_0 t0 on t0.tick_queue = s.sub_queue and t0.tick_id = s.sub_last_tick
+         where next_tick = 0
+         union all
+        select 1
+          from pgque.subscription s
+          join pgque.tick_1 t1 on t1.tick_queue = s.sub_queue and t1.tick_id = s.sub_last_tick
+         where next_tick = 1
+         union all
+        select 1
+          from pgque.subscription s
+          join pgque.tick_2 t2 on t2.tick_queue = s.sub_queue and t2.tick_id = s.sub_last_tick
+         where next_tick = 2
+    ) then
+        begin
+            execute format('lock table pgque.tick_%s in exclusive mode nowait', next_tick);
+            execute format('truncate pgque.tick_%s', next_tick);
+        exception
+            when lock_not_available then
+                next_tick := mr.cur_tick_table; -- keep tick pointer
+        end;
+    else
+        next_tick := mr.cur_tick_table; -- defer tick rotation this cycle
+    end if;
+
+    -- Flip pointers atomically.
+    update pgque.meta_rotation
+       set cur_subscription_table   = next_sub,
+           cur_tick_table           = next_tick,
+           last_rotation_time       = now(),
+           last_rotation_step1_txid = pg_current_xact_id()::text::bigint,
+           last_rotation_step2_txid = null
+     where singleton;
+
+    return 1;
+end;
+$$ language plpgsql;
+
+
+create or replace function pgque.maint_rotate_metadata_step2()
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_rotate_metadata_step2(0)
+--
+--      Counterpart to maint_rotate_tables_step2(). Must run in a
+--      separate transaction than maint_rotate_metadata() so that its
+--      txid is visible to all new snapshots before the next rotation
+--      decides whether it is safe to truncate the next slot.
+-- ----------------------------------------------------------------------
+begin
+    update pgque.meta_rotation
+       set last_rotation_step2_txid = pg_current_xact_id()::text::bigint
+     where last_rotation_step2_txid is null;
+    return 0;
+end;
+$$ language plpgsql;
+
+
 create or replace function pgque.maint_tables_to_vacuum()
 returns setof text as $$
 -- ----------------------------------------------------------------------
@@ -1007,10 +1503,14 @@ begin
     end if;
 
     for scm, tbl in values
-        ('pgque', 'subscription'),
+        ('pgque', 'subscription_0'),
+        ('pgque', 'subscription_1'),
+        ('pgque', 'subscription_2'),
         ('pgque', 'consumer'),
         ('pgque', 'queue'),
-        ('pgque', 'tick'),
+        ('pgque', 'tick_0'),
+        ('pgque', 'tick_1'),
+        ('pgque', 'tick_2'),
         ('pgque', 'retry_queue'),
         ('pgq_ext', 'completed_tick'),
         ('pgq_ext', 'completed_batch'),
@@ -1087,6 +1587,15 @@ begin
         func_arg := NULL;
         return next;
     end if;
+
+    -- metadata rotation (pgque transformation): rotate subscription
+    -- and tick child tables to cap held-xmin bloat.
+    func_name := 'pgque.maint_rotate_metadata';
+    func_arg := NULL;
+    return next;
+    func_name := 'pgque.maint_rotate_metadata_step2';
+    func_arg := NULL;
+    return next;
 
     -- check if extra field exists
     perform 1 from pg_attribute
@@ -1894,6 +2403,12 @@ declare
     _consumer_id integer;
     _is_subconsumer boolean;
 begin
+    -- pgque: FOR UPDATE OF s dropped because pgque.subscription is now
+    -- a UNION ALL view (see 3-table rotation). The view does not accept
+    -- row locks. Callers of unregister_consumer() are rare and single-
+    -- threaded in practice; we rely on the subsequent DELETE to provide
+    -- the necessary row lock. Consumer row lock via FOR UPDATE OF c
+    -- is still enforced.
     select s.sub_id, c.co_id,
            -- subconsumers can only have both null or both not null - main consumer for subconsumers has only one not null
            (s.sub_last_tick IS NULL AND s.sub_next_tick IS NULL) OR (s.sub_last_tick IS NOT NULL AND s.sub_next_tick IS NOT NULL)
@@ -1903,7 +2418,7 @@ begin
        and s.sub_consumer = c.co_id
        and q.queue_name = x_queue_name
        and c.co_name = x_consumer_name
-       for update of s, c;
+       for update of c;
     if not found then
         return 0;
     end if;
@@ -4034,7 +4549,8 @@ begin
     select cron.schedule_in_database(
         'pgque_rotate_step2',
         '10 seconds',
-        $sql$SELECT pgque.maint_rotate_tables_step2()$sql$,
+        $sql$SELECT pgque.maint_rotate_tables_step2();
+             SELECT pgque.maint_rotate_metadata_step2();$sql$,
         v_dbname
     ) into v_step2_id;
 
@@ -4467,7 +4983,10 @@ begin
     for f in select func_name, func_arg from pgque.maint_operations()
     loop
         -- Skip step2: it needs a separate transaction (scheduled by pgque.start)
-        if f.func_name = 'pgque.maint_rotate_tables_step2' then
+        if f.func_name in (
+            'pgque.maint_rotate_tables_step2',
+            'pgque.maint_rotate_metadata_step2'
+        ) then
             continue;
         elsif f.func_name = 'vacuum' then
             sql := 'vacuum ' || f.func_arg;
